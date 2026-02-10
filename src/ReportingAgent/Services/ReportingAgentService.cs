@@ -6,6 +6,7 @@ namespace ReportingAgent.Services;
 public sealed class ReportingAgentService(
     CollectionSchemaClient collectionSchemaClient,
     DataQueryClient dataQueryClient,
+    OpenAiClient openAiClient,
     ILogger<ReportingAgentService> logger)
 {
     public const string SystemPrompt = """
@@ -26,11 +27,10 @@ public sealed class ReportingAgentService(
 ## 工作流程
 1. 理解需求
 2. 获取元数据
-3. 数据采样
-4. 选择数据集
-5. 组装数据集
-6. 验证执行
-7. 返回结果
+3. 基于元数据生成业务数据集草案
+4. 数据采样
+5. 验证执行
+6. 返回结果
 
 ## 重要规则
 - 组装的业务数据集必须要有标准数据集定义作为来源，不能自行新增数据来源
@@ -47,30 +47,45 @@ public sealed class ReportingAgentService(
         var parameters = await collectionSchemaClient.GetAllParametersAsync(cancellationToken);
         var valueSets = await collectionSchemaClient.GetAllValueSetsAsync(cancellationToken);
 
-        var requirementTokens = request.RequirementText.Split([' ', ',', '，', '。', ';', '；'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        var candidateCollections = collections
-            .Where(c => requirementTokens.Any(t => c.Name.Contains(t, StringComparison.OrdinalIgnoreCase) || c.Description.Contains(t, StringComparison.OrdinalIgnoreCase)))
-            .ToList();
-
-        if (candidateCollections.Count == 0)
+        var metadataContext = new
         {
-            candidateCollections = collections.Take(2).ToList();
-        }
+            Collections = collections,
+            Parameters = parameters,
+            ValueSets = valueSets,
+            RequiredOutputSchema = new
+            {
+                Name = "string",
+                Sources = new[] { "collectionName" },
+                Inputs = new[] { new { Name = "string", DataType = "string", SourceCollection = "string", Description = "string" } },
+                Outputs = new[] { new { Name = "string", DataType = "string", SourceCollection = "string", Description = "string" } },
+                ValueSetMappings = new[] { new { ParameterName = "string", ValueSetName = "string", Description = "string" } },
+                Notes = "string"
+            }
+        };
 
+        var llmDraft = await openAiClient.BuildDatasetDraftAsync(
+            SystemPrompt,
+            request.RequirementText,
+            request.PreferredInputs,
+            metadataContext,
+            cancellationToken);
+
+        var candidateCollections = SelectCandidateCollections(collections, llmDraft, request.RequirementText);
         var selectedParameters = parameters.Where(p => candidateCollections.Any(c => c.Name == p.CollectionName)).ToList();
 
-        var inputs = selectedParameters
-            .Where(p => p.Direction.Equals("Input", StringComparison.OrdinalIgnoreCase))
-            .Select(p => new DatasetField(p.Name, p.DataType, "Input", p.CollectionName, $"输入参数（默认值: {p.DefaultValue ?? "无"}）"))
-            .DistinctBy(p => (p.Name, p.SourceCollection, p.Direction))
-            .ToList();
+        var inputs = BuildFields(
+            llmDraft?.Inputs,
+            selectedParameters,
+            candidateCollections,
+            direction: "Input",
+            fallbackDescription: p => $"输入参数（默认值: {p.DefaultValue ?? "无"}）");
 
-        var outputs = selectedParameters
-            .Where(p => p.Direction.Equals("Output", StringComparison.OrdinalIgnoreCase))
-            .Select(p => new DatasetField(p.Name, p.DataType, "Output", p.CollectionName, "输出参数"))
-            .DistinctBy(p => (p.Name, p.SourceCollection, p.Direction))
-            .ToList();
+        var outputs = BuildFields(
+            llmDraft?.Outputs,
+            selectedParameters,
+            candidateCollections,
+            direction: "Output",
+            fallbackDescription: _ => "输出参数");
 
         var joinHints = BuildJoinHints(selectedParameters);
 
@@ -81,24 +96,12 @@ public sealed class ReportingAgentService(
                 joinHints.Where(j => j.LeftCollection == c.Name || j.RightCollection == c.Name).ToList()))
             .ToList();
 
-        var valueSetMappings = selectedParameters
-            .Where(p => !string.IsNullOrWhiteSpace(p.ValueSetName))
-            .Select(p =>
-            {
-                var vs = valueSets.FirstOrDefault(v => v.Name.Equals(p.ValueSetName, StringComparison.OrdinalIgnoreCase));
-                return new ValueSetMapping(
-                    p.Name,
-                    p.ValueSetName!,
-                    vs?.Description ?? "值域定义未找到",
-                    vs?.Items ?? []);
-            })
-            .DistinctBy(x => (x.ParameterName, x.ValueSetName))
-            .ToList();
+        var valueSetMappings = BuildValueSetMappings(llmDraft?.ValueSetMappings, selectedParameters, valueSets);
 
         await TrySampleDataAsync(inputs, request.PreferredInputs, cancellationToken);
 
         var draft = new BusinessDatasetDefinition(
-            Name: $"Business_{DateTime.UtcNow:yyyyMMddHHmmss}",
+            Name: string.IsNullOrWhiteSpace(llmDraft?.Name) ? $"Business_{DateTime.UtcNow:yyyyMMddHHmmss}" : llmDraft!.Name!,
             Requirement: request.RequirementText,
             Sources: sources,
             Inputs: inputs,
@@ -115,6 +118,111 @@ public sealed class ReportingAgentService(
             : new ValidationResult(validationResponse.Success, validationResponse.Message, validationResponse.PreviewRows);
 
         return draft with { Validation = validation };
+    }
+
+    private static List<CollectionDefinition> SelectCandidateCollections(
+        IReadOnlyList<CollectionDefinition> collections,
+        LlmDraftResponse? llmDraft,
+        string requirementText)
+    {
+        var selectedFromLlm = (llmDraft?.Sources ?? [])
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var candidate = collections
+            .Where(c => selectedFromLlm.Contains(c.Name))
+            .ToList();
+
+        if (candidate.Count > 0)
+        {
+            return candidate;
+        }
+
+        var requirementTokens = requirementText.Split([' ', ',', '，', '。', ';', '；'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        candidate = collections
+            .Where(c => requirementTokens.Any(t => c.Name.Contains(t, StringComparison.OrdinalIgnoreCase) || c.Description.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        return candidate.Count == 0 ? collections.Take(2).ToList() : candidate;
+    }
+
+    private static List<DatasetField> BuildFields(
+        IReadOnlyList<LlmField>? llmFields,
+        IReadOnlyList<CollectionParameter> selectedParameters,
+        IReadOnlyList<CollectionDefinition> candidateCollections,
+        string direction,
+        Func<CollectionParameter, string> fallbackDescription)
+    {
+        var allowedCollections = candidateCollections.Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var llmFieldCandidates = llmFields ?? [];
+
+        var fieldsFromLlm = llmFieldCandidates
+            .Where(f =>
+                !string.IsNullOrWhiteSpace(f.Name) &&
+                !string.IsNullOrWhiteSpace(f.SourceCollection) &&
+                allowedCollections.Contains(f.SourceCollection!))
+            .Select(f => new DatasetField(
+                f.Name!,
+                string.IsNullOrWhiteSpace(f.DataType) ? "string" : f.DataType!,
+                direction,
+                f.SourceCollection!,
+                string.IsNullOrWhiteSpace(f.Description) ? $"{direction}字段" : f.Description!))
+            .DistinctBy(f => (f.Name, f.SourceCollection, f.Direction), StringTupleComparer.Instance)
+            .ToList();
+
+        if (fieldsFromLlm.Count > 0)
+        {
+            return fieldsFromLlm;
+        }
+
+        return selectedParameters
+            .Where(p => p.Direction.Equals(direction, StringComparison.OrdinalIgnoreCase))
+            .Select(p => new DatasetField(p.Name, p.DataType, direction, p.CollectionName, fallbackDescription(p)))
+            .DistinctBy(p => (p.Name, p.SourceCollection, p.Direction), StringTupleComparer.Instance)
+            .ToList();
+    }
+
+    private static List<ValueSetMapping> BuildValueSetMappings(
+        IReadOnlyList<LlmValueSetMapping>? llmMappings,
+        IReadOnlyList<CollectionParameter> selectedParameters,
+        IReadOnlyList<ValueSetDefinition> valueSets)
+    {
+        var valueSetByName = valueSets.ToDictionary(v => v.Name, StringComparer.OrdinalIgnoreCase);
+
+        var normalizedFromLlm = (llmMappings ?? [])
+            .Where(m => !string.IsNullOrWhiteSpace(m.ParameterName) && !string.IsNullOrWhiteSpace(m.ValueSetName))
+            .Select(m =>
+            {
+                valueSetByName.TryGetValue(m.ValueSetName!, out var vs);
+                return new ValueSetMapping(
+                    m.ParameterName!,
+                    m.ValueSetName!,
+                    string.IsNullOrWhiteSpace(m.Description) ? vs?.Description ?? "值域定义未找到" : m.Description!,
+                    vs?.Items ?? []);
+            })
+            .DistinctBy(x => (x.ParameterName, x.ValueSetName), StringTupleComparer.Instance)
+            .ToList();
+
+        if (normalizedFromLlm.Count > 0)
+        {
+            return normalizedFromLlm;
+        }
+
+        return selectedParameters
+            .Where(p => !string.IsNullOrWhiteSpace(p.ValueSetName))
+            .Select(p =>
+            {
+                var vs = valueSets.FirstOrDefault(v => v.Name.Equals(p.ValueSetName, StringComparison.OrdinalIgnoreCase));
+                return new ValueSetMapping(
+                    p.Name,
+                    p.ValueSetName!,
+                    vs?.Description ?? "值域定义未找到",
+                    vs?.Items ?? []);
+            })
+            .DistinctBy(x => (x.ParameterName, x.ValueSetName), StringTupleComparer.Instance)
+            .ToList();
     }
 
     private static List<JoinHint> BuildJoinHints(IReadOnlyList<CollectionParameter> selectedParameters)
@@ -166,5 +274,28 @@ public sealed class ReportingAgentService(
                 logger.LogWarning(ex, "数据采样失败，集合: {CollectionName}", inputGroup.Key);
             }
         }
+    }
+
+    private sealed class StringTupleComparer : IEqualityComparer<(string, string, string)>, IEqualityComparer<(string, string)>
+    {
+        public static StringTupleComparer Instance { get; } = new();
+
+        public bool Equals((string, string, string) x, (string, string, string) y)
+            => string.Equals(x.Item1, y.Item1, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(x.Item2, y.Item2, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(x.Item3, y.Item3, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string, string, string) obj)
+            => HashCode.Combine(
+                obj.Item1.ToUpperInvariant(),
+                obj.Item2.ToUpperInvariant(),
+                obj.Item3.ToUpperInvariant());
+
+        public bool Equals((string, string) x, (string, string) y)
+            => string.Equals(x.Item1, y.Item1, StringComparison.OrdinalIgnoreCase)
+               && string.Equals(x.Item2, y.Item2, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string, string) obj)
+            => HashCode.Combine(obj.Item1.ToUpperInvariant(), obj.Item2.ToUpperInvariant());
     }
 }
